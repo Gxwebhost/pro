@@ -6,7 +6,6 @@ import time
 from collections import defaultdict
 
 import sys
-sys.path.append('/root/common')
 from database import get_webhook
 app = Flask(__name__)
 
