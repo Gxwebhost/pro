@@ -1,7 +1,7 @@
 {
-  "name": "your-app-name",
+  "name": "roblox-webhook-proxy",
   "version": "1.0.0",
-  "main": "index.js",
+  "main": "api/index.js",
   "scripts": {
     "start": "node api/index.js"
   },
