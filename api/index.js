@@ -1,7 +1,6 @@
 // This is a Node.js (Express) version of your Flask webhook proxy.
 
 const express = require("express");
-const rateLimit = require('express-rate-limit');
 const bodyParser = require("body-parser");
 const fs = require("fs");
 const path = require("path");
